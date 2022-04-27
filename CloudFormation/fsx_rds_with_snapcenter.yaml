@@ -1,0 +1,871 @@
+# Copyright NetApp 2022. Developed by NetApp Solutions Engineering Team
+#
+# Description: This AWS CloudFormation Template can be used to automate 
+# the integration of Netapp Fsx Ontap with Custom RDS (Relational Database Service)
+# to allow Fsx Ontap to be used as a backend persistent storage for the database.
+# This template also integrates the Netapp Snapcenter software with Fsx Ontap
+# to allow restore and backup of the data from Fsx.
+
+
+# Pre-requisites for running this template
+
+#   - Custom RDS Instance with IAM role that includes "ssm:SendCommand", "ssm:ListCommandInvocations" 
+#     and "ssm:GetCommandInvocation" permissions along with the default permissions
+#     required for RDS (https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/custom-setup-sqlserver.html#custom-setup-sqlserver.iam-vpc)
+#   
+#   - Custom RDS Instance and Fsx Ontap should be able to communicate with each other 
+#     (networking and security groups need to ensure the same)
+#
+#   - S3 Bucket with packages.zip, SnapCenter executable file and a pem file uploaded to it
+
+
+
+Parameters:
+  Prefix:
+    Description: LUN and Volume Name Prefix
+    Type: String
+  LunSizeData: 
+    Description: Size of LUN
+    Type: Number
+    Default: 0
+  LunSizeLog: 
+    Description: Size of LUN
+    Type: Number
+    Default: 0
+  LunSizeSnapInfo: 
+    Description: Size of LUN for RDS Log Folder
+    Type: Number
+    Default: 0
+  LogFolderDriveLetter:
+    Description: Enter the drive letter to be used for storing log folder in RDS Custom Instance (e.g. G,H,I etc.)
+    Type: String
+  OsType:
+    Description: OS Type - windows or linux, specify windows_2008 if not sure
+    Type: String
+    Default: 'windows'
+  PrivateSubnet1ID:
+    Description: Choose the Id of the private subnet 1 in Availability Zone 1 (e.g., subnet-a0246dcd).
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2ID:
+    Description: Choose the Id of the private subnet 2 in Availability Zone 2 (e.g., subnet-a0246dcd).
+    Type: AWS::EC2::Subnet::Id
+  StorageCapacityOntap:
+    Default: 1024
+    Description: Specify the storage capacity of the file system being created, in GibiBytes if UseNewOntap is true.
+      Valid values are 1024 GiB - 196608 GiB. Consider choosing a higher value for greater capacity.
+    Type: Number
+  ThroughputCapacityOntap:
+    Default: 128
+    Description: Specify the throughput of the Amazon FSx ONTAP file system. Valid values are 128 - 2048 if UseNewOntap is true.
+      Consider choosing a higher value for better performance.
+    Type: Number
+  VPCID:
+    Description: Choose the Id of the VPC (e.g., vpc-0343606e).
+    Type: AWS::EC2::VPC::Id
+  SecurityGroupId:
+    Description: Specify the Security Group to be used for FSX and Snapcenter server.
+    Type: AWS::EC2::SecurityGroup::Id
+  FsxAdminPassword:
+    Description: FSX ONTAP SVM Admin password
+    Type: String
+    NoEcho: True
+  AwsAccessKey:
+    Description: AWS Access Key
+    Type: String
+    NoEcho: True
+  AwsSecretKey:
+    Description: Aws Secret Key
+    Type: String
+    NoEcho: True
+  UseNewOntap:
+    Description: Do you want to create a new ONTAP setup?
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  FsxFileSystemId:
+    Description: Enter Fsx File System ID if UseNewOntap is false
+    Type: String
+    Default: ''
+  FsxSvmId:
+    Description: Enter Fsx SVM ID if UseNewOntap is false
+    Type: String
+    Default: ''
+  CustomRdsEC2InstanceId:
+    Description: Enter the EC2 Instance ID of the Custom RDS Instance
+    Type: String
+  CustomRdsEC2InstanceIP:
+    Description: Enter the EC2 Instance IP of the Custom RDS Instance
+    Type: String
+  S3BucketName:
+    Description: Enter the S3 bucket which contains Snapcenter installer file, pem file and pkgs.tar FILE
+    Type: String
+  S3FileKey:
+    Description: Enter the File Key for the Snapcenter Server installer file from the S3 bucket
+    Type: String
+  S3PemFile:
+    Description: Aws pem key (Format - key-name.pem)
+    Type: String
+  WindowsAmiId:
+    Description: Windows AMI ID for Snapcenter server
+    Type: String
+  SnapHostType:
+    Description: Select the type of instance you want for the Snapcenter host (min. 8GB RAM required)
+    Type: String
+    Default: 't3.2xlarge'
+
+
+  
+
+Conditions:
+  ProvisionOntap: !Equals [!Ref UseNewOntap, 'true']
+  
+
+Resources:
+  LambdaBasicExecutionRoleOntap:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RDSFsxCustomAutomationLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - fsx:DescribeFileSystems
+                  - fsx:DescribeStorageVirtualMachines
+                Resource:
+                  - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:file-system/*
+                  - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:storage-virtual-machine/*
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::*
+                  - !Sub arn:aws:s3:::*/*
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ec2:DescribeRouteTables
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              
+
+
+  CustomFSXResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'CustomFunction.Arn'
+      ResourceRef1: !If [ProvisionOntap, !Ref ONTAPFileSystemSVM, !Ref FsxSvmId]
+      ResourceRef2: !If [ProvisionOntap, !Ref ONTAPFileSystem, !Ref FsxFileSystemId]
+      ResourceRef3: !Sub ${CustomRdsEC2InstanceId}
+      ResourceRef4: !Sub ${VPCID}
+  CustomFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Retrieves ONTAP FSx DNS name and gets IQN value from custom RDS EC2"
+      Timeout: 300
+      Role: !GetAtt 'LambdaBasicExecutionRoleOntap.Arn'
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import cfnresponse
+          import boto3
+          import time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info('got event {}'.format(event))
+            try:
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                logger.info('Incoming RequestType: Delete operation')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              if event['RequestType'] in ["Create", "Update"]:
+                # 1. retrieve resource reference ID or Name
+                ResourceRef1=event['ResourceProperties']['ResourceRef1']
+                ResourceRef2=event['ResourceProperties']['ResourceRef2']
+                ResourceRef3=event['ResourceProperties']['ResourceRef3']
+                ResourceRef4=event['ResourceProperties']['ResourceRef4']
+                # 2. retrieve boto3 client
+                client = boto3.client('fsx')
+                # 3. Invoke describe/retrieve function using ResourceRef
+                response = client.describe_storage_virtual_machines(StorageVirtualMachineIds=[ResourceRef1], Filters=[{'Name': 'file-system-id','Values': [ResourceRef2,]},])
+                responseFs = client.describe_file_systems(FileSystemIds=[ResourceRef2])
+                # 4. Parse and return required attributes
+                responseData = {}
+                responseData['SVMName']= response.get('StorageVirtualMachines')[0].get('Name')
+                logger.info('Retrieved SVMName!')
+                responseData['SVMDNSName']= response.get('StorageVirtualMachines')[0].get('Endpoints').get('Iscsi').get('DNSName')
+                logger.info('Retrieved SVMDNSName!')
+                responseData['FSMgmtIP'] = responseFs.get('FileSystems')[0].get('OntapConfiguration').get('Endpoints').get('Management').get('IpAddresses')[0]
+                logger.info('Retrieved FSMgmtIP!')
+                responseData['route_table_id'] = responseFs.get('FileSystems')[0].get('OntapConfiguration').get('RouteTableIds')[0]
+                logger.info('Retrieved Route Table ID')
+                responseData['FsxSvmIscsiIP1'] = response.get('StorageVirtualMachines')[0].get('Endpoints').get('Iscsi').get('IpAddresses')[0]
+                responseData['FsxSvmIscsiIP2'] = response.get('StorageVirtualMachines')[0].get('Endpoints').get('Iscsi').get('IpAddresses')[1]
+                logger.info('Retrieved FsxSvmIscsiIP!')
+                responseData['SVMMgmtIP'] = response.get('StorageVirtualMachines')[0].get('Endpoints').get('Management').get('IpAddresses')[0]
+
+
+                #Code for Windows ISCSI initiator config
+                ssm_client = boto3.client('ssm')      
+                response3 = ssm_client.send_command(InstanceIds=[ResourceRef3], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': ['Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False', 'Start-service -Name msiscsi', 'Set-Service -Name msiscsi -StartupType Automatic']}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                time.sleep(10)
+                command_id = response3.get('Command').get('CommandId')
+                time.sleep(10)
+                op3 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef3)
+                op3_val = op3.get('StandardOutputContent')
+                if "error" in op3_val.lower():
+                  logger.error("Error with initial ISCSI Setup")
+                  responseData = {"Data": op3_val}
+                  cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+                flag = False
+                while(flag == False):
+                  response5 = ssm_client.send_command(InstanceIds=[ResourceRef3], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': ['Get-InitiatorPort | select NodeAddress']}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                  time.sleep(10)
+                  command_id = response5.get('Command').get('CommandId')
+                  time.sleep(10)
+                  response4 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef3)
+                  iqn_val_temp = response4.get('StandardOutputContent')
+                  
+                  logger.info("iqn_val_temp")
+                  logger.info(iqn_val_temp)
+                  iqn_val_temp_one = iqn_val_temp.split('\r\n')
+                  logger.info("iqn_val_temp_one")
+                  logger.info(iqn_val_temp_one)
+                  if len(iqn_val_temp_one) > 2:
+                    if "iqn" in iqn_val_temp_one[3]:
+                      flag = True
+                  time.sleep(2)
+                iqn_val_temp_two = iqn_val_temp_one[3]
+                logger.info("iqn_val_temp_two")
+                logger.info(iqn_val_temp_two)
+                responseData['iqn_val'] = iqn_val_temp_two  
+                response6 = ssm_client.send_command(InstanceIds=[ResourceRef3], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': ['winrm quickconfig -quiet', 'Install-WindowsFeature -name Multipath-IO -Restart' ]}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                time.sleep(10)
+                command_id = response6.get('Command').get('CommandId')
+                time.sleep(10)
+                op6 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef3)
+                op6_val = op6.get('StandardOutputContent')
+                if "error" in op6_val.lower():
+                  logger.error("Error with MultiPath IO Setup")
+                  responseData = {"Data": op6_val}
+                  cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                logger.info('Unexpected RequestType!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as err:
+              logger.error(err)
+              responseData = {"Data": str(err)}
+              cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+            return
+
+
+  S3GatewayEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:GetBucketLocation'
+              - 's3:PutObject'
+            Resource:
+              - 'arn:aws:s3:::*'
+              - 'arn:aws:s3:::*/*'
+      RouteTableIds:
+        - !Sub '${CustomFSXResource.route_table_id}'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPCID
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AWS::StackName
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: RDSFsxCustomAutomationEC2Policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub arn:aws:s3:::*
+                  - !Sub arn:aws:s3:::*/*
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:ListAssociations
+                  - ssm:ListInstanceAssociations
+                  - ssm:ListCommandInvocations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                  - ssm:GetCommandInvocation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeTags
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - ssm:GetParameter
+                Resource: '*'
+                  
+              
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+
+  LambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.7
+      Content:
+        S3Bucket: !Sub ${S3BucketName}
+        S3Key: packages.zip
+      LayerName: pythonRequests
+
+
+  CustomFsxCmdResource:
+      Type: AWS::CloudFormation::CustomResource
+      DependsOn: LambdaLayer
+      Properties:
+        ServiceToken: !GetAtt 'CustomFsxCmdFunction.Arn'
+        ResourceRef1: !Sub 'fsxadmin:${FsxAdminPassword}'
+        ResourceRef2: !Sub '${CustomFSXResource.FSMgmtIP}'
+        ResourceRef3: !Sub '${CustomFSXResource.iqn_val}'
+        ResourceRef4: !Sub ${OsType}
+        ResourceRef5: !Sub ${CustomFSXResource.SVMName}
+        ResourceRef6: !Sub ${Prefix}
+        ResourceRef7: !Sub ${LunSizeData}
+        ResourceRef8: !Sub ${LunSizeLog}
+        ResourceRef9: !Sub ${LunSizeSnapInfo} 
+  CustomFsxCmdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Run Commands on FSX"
+      Timeout: 120
+      Role: !GetAtt 'LambdaBasicExecutionRoleOntap.Arn'
+      Runtime: python3.7
+      Layers:
+        - !Ref LambdaLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1ID
+          - !Ref PrivateSubnet2ID
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import cfnresponse
+          import requests
+          import time
+          import base64
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info('got event {}'.format(event))
+            try:
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                logger.info('Incoming RequestType: Delete operation')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              if event['RequestType'] in ["Create", "Update"]:
+                
+                # 1. retrieve resource reference ID or Name
+                ResourceRef1= event['ResourceProperties']['ResourceRef1']
+                ResourceRef2=event['ResourceProperties']['ResourceRef2']
+                ResourceRef3=event['ResourceProperties']['ResourceRef3']
+                ResourceRef4=event['ResourceProperties']['ResourceRef4']
+                ResourceRef5=event['ResourceProperties']['ResourceRef5']
+                ResourceRef6=event['ResourceProperties']['ResourceRef6']
+                ResourceRef7=event['ResourceProperties']['ResourceRef7']
+                ResourceRef8=event['ResourceProperties']['ResourceRef8']
+                ResourceRef9=event['ResourceProperties']['ResourceRef9']
+
+                ResourceRef1 = ResourceRef1.encode("ascii")
+                ResourceRef1=base64.b64encode(ResourceRef1)
+                ResourceRef1 = ResourceRef1.decode("utf-8")
+                #Code for Windows ISCSI initiator config
+                if "windows" in ResourceRef4:
+                  OsIgrp = "windows"
+                else:
+                  OsIgrp = ResourceRef4
+                #IGroup creation
+                url = "https://{}/api/protocols/san/igroups".format(ResourceRef2)
+                headers = {
+                    'authorization': 'Basic {}'.format(ResourceRef1),
+                    'content-type': "application/json",
+                    'accept': "application/json"
+                }
+                payload = {
+                  "protocol": "iscsi",
+                  "initiators.name": [ResourceRef3],
+                  "name": "{}igrp".format(ResourceRef6),
+                  "os_type": OsIgrp,
+                  "svm.name": ResourceRef5
+                }
+                response = requests.post(url, headers=headers, json=payload, verify=False)
+                time.sleep(2)
+                check1 = requests.get(url, headers=headers, verify=False)
+                check1 = str(check1.json())
+                if (check1.find("{}igrp".format(ResourceRef6)) != -1):
+                    pass
+                else:
+                    err = "Igroup Creation Failed"
+                    logger.error(err)
+                    responseData = {"Data": str(err)}
+                    cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+                for i in range(3):
+                    #Volume creation
+                    if(i==0):
+                        lunSize = ResourceRef7
+                        volSize = 1.1*int(lunSize)
+                    elif(i==1):
+                        lunSize = ResourceRef8
+                        volSize = 1.1*int(lunSize)
+                    else:
+                        lunSize = ResourceRef9
+                        volSize = 1.1*int(lunSize)
+                    url = "https://{}/api/storage/volumes".format(ResourceRef2)
+                    payload = {
+                      "svm.name": ResourceRef5,
+                      "name": "{}vol{}".format(ResourceRef6,str(i)),
+                      "aggregates.name": ["aggr1"],
+                      "size": str(volSize)+"G",
+                      "state": "online",
+                      "tiering.policy": "snapshot-only",
+                      "space.snapshot.reserve_percent": 0,
+                      "autosize.mode": "grow",
+                      "snapshot_policy": "none"
+                    }
+                    response = requests.post(url, headers=headers, json=payload, verify=False)
+                    time.sleep(2)
+                    check2 = requests.get(url, headers=headers, verify=False)
+                    check2 = str(check2.json())
+                    if (check2.find("{}vol{}".format(ResourceRef6,str(i))) != -1):
+                        pass
+                    else:
+                        err = "Volume Creation Failed"
+                        logger.error(err)
+                        responseData = {"Data": str(err)}
+                        cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+                    #Lun Creation
+                    url = "https://{}/api/storage/luns".format(ResourceRef2)
+                    payload = {
+                      "svm.name": ResourceRef5,
+                      "location.volume.name": "{}vol{}".format(ResourceRef6,str(i)),
+                      "name": "/vol/{}vol{}/{}lun{}".format(ResourceRef6,str(i),ResourceRef6,str(i)),
+                      "os_type": ResourceRef4,
+                      "space.size": str(lunSize)+"G"
+                    }
+                    response = requests.post(url, headers=headers, json=payload, verify=False)
+                    time.sleep(2)
+                    check3 = requests.get(url, headers=headers, verify=False)
+                    check3 = str(check3.json())
+                    if (check3.find("/vol/{}vol{}/{}lun{}".format(ResourceRef6,str(i),ResourceRef6,str(i))) != -1):
+                        pass
+                    else:
+                        err = "LUN Creation Failed"
+                        logger.error(err)
+                        responseData = {"Data": str(err)}
+                        cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+                    #Lun Mapping
+                    url = "https://{}/api/protocols/san/lun-maps".format(ResourceRef2)
+                    payload = {
+                      "svm.name": ResourceRef5,
+                      "lun.name": "/vol/{}vol{}/{}lun{}".format(ResourceRef6,str(i),ResourceRef6,str(i)),
+                      "igroup.name": "{}igrp".format(ResourceRef6)
+                    }
+                    response = requests.post(url, headers=headers, json=payload, verify=False)
+                    time.sleep(2)
+                    check4 = requests.get(url, headers=headers, verify=False)
+                    check4 = str(check4.json())
+                    if (check4.find("/vol/{}vol{}/{}lun{}".format(ResourceRef6,str(i),ResourceRef6,str(i))) != -1):
+                        pass
+                    else:
+                        err = "LUN Mapping Failed"
+                        logger.error(err)
+                        responseData = {"Data": str(err)}
+                        cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                logger.info('Unexpected RequestType!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as err:
+              logger.error(err)
+              responseData = {"Data": str(err)}
+              cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+            return
+
+  CustomIscsiResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: CustomFsxCmdResource
+    Properties:
+      ServiceToken: !GetAtt 'CustomIscsiFunction.Arn'
+      ResourceRef1: !Sub '${CustomFSXResource.FsxSvmIscsiIP1}'
+      ResourceRef2: !Sub '${CustomFSXResource.FsxSvmIscsiIP2}'
+      ResourceRef3: !Sub ${CustomRdsEC2InstanceId}
+      ResourceRef4: !Sub ${LunSizeSnapInfo}
+      ResourceRef5: !Sub ${LogFolderDriveLetter}
+      ResourceRef6: !Sub ${CustomRdsEC2InstanceIP}
+  CustomIscsiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Sets up ISCSI"
+      Timeout: 400
+      Role: !GetAtt 'LambdaBasicExecutionRoleOntap.Arn'
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import cfnresponse
+          import boto3
+          import time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info('got event {}'.format(event))
+            try:
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                logger.info('Incoming RequestType: Delete operation')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              if event['RequestType'] in ["Create", "Update"]:
+                time.sleep(180)
+                # 1. retrieve resource reference ID or Name
+                ResourceRef1= event['ResourceProperties']['ResourceRef1']
+                ResourceRef2=event['ResourceProperties']['ResourceRef2']
+                ResourceRef3=event['ResourceProperties']['ResourceRef3']
+                ResourceRef4=event['ResourceProperties']['ResourceRef4']
+                ResourceRef5=event['ResourceProperties']['ResourceRef5']
+                ResourceRef6=event['ResourceProperties']['ResourceRef6']
+                #Code for Windows ISCSI initiator config
+
+                
+                str = "$TargetPortals = ('" + ResourceRef1 + "','" + ResourceRef2 + "')"
+                str1 = '$diskNumberString = Get-Disk | findstr NETAPP | findstr Online | findstr ' + ResourceRef4
+                str2 = 'New-Partition -DiskNumber $diskNumber -DriveLetter ' + ResourceRef5 + ' -UseMaximumSize'
+                str3 = 'Format-Volume -DriveLetter ' + ResourceRef5 + ' -FileSystem NTFS -AllocationUnitSize 65536'
+                str4 = 'foreach ($TargetPortal in $TargetPortals) {New-IscsiTargetPortal -TargetPortalAddress $TargetPortal -TargetPortalPortNumber 3260 -InitiatorPortalAddress ' + ResourceRef6 + '}'
+                str5 = '1..4 | %{Foreach($TargetPortal in $TargetPortals){Get-IscsiTarget | Connect-IscsiTarget -IsMultipathEnabled $true -TargetPortalAddress $TargetPortal -InitiatorPortalAddress ' + ResourceRef6 + ' -IsPersistent $true} }'
+
+                ssm_client = boto3.client('ssm')
+                response3 = ssm_client.send_command(InstanceIds=[ResourceRef3], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': [str, str4,'New-MSDSMSupportedHW -VendorId MSFT2005 -ProductId iSCSIBusType_0x9', str5, 'Set-MSDSMGlobalDefaultLoadBalancePolicy -Policy RR', '$disks = Get-Disk | where PartitionStyle -eq raw', 'foreach ($disk in $disks) {Initialize-Disk $disk.Number}', str1, '$diskNumber = $diskNumberString.split()[0]', str2, str3]}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                time.sleep(10)
+                command_id = response3.get('Command').get('CommandId')
+                time.sleep(10)
+                op3 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef3)
+                op3_val = op3.get('StandardOutputContent')
+                if "error" in op3_val.lower():
+                  logger.error("Error with FSX Mount on RDS Instance")
+                  responseData = {"Data": op3_val}
+                  cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+                logger.info('Mount completed')        
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                logger.info('Unexpected RequestType!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as err:
+              logger.error(err)
+              responseData = {"Data": str(err)}
+              cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+            return
+
+  EC2InstanceSnp:
+    Type: AWS::EC2::Instance
+    DependsOn: S3GatewayEndpoint
+    Properties:
+      ImageId: !Ref 'WindowsAmiId'
+      AvailabilityZone: !Sub ${AWS::Region}a
+      InstanceType: !Ref SnapHostType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds: [!Ref 'SecurityGroupId']
+      SubnetId: !Ref 'PrivateSubnet1ID'
+      KeyName: !Select [0, !Split ['.', !Ref S3PemFile]]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+  
+  
+  ONTAPFileSystem:
+    Type: AWS::FSx::FileSystem
+    Condition: ProvisionOntap
+    Properties:
+      FileSystemType: "ONTAP"
+      StorageCapacity: !Ref 'StorageCapacityOntap'
+      SecurityGroupIds:
+        - !Ref 'SecurityGroupId'
+      SubnetIds:
+        - !Ref PrivateSubnet1ID
+        - !Ref PrivateSubnet2ID
+      OntapConfiguration:
+        DeploymentType: "MULTI_AZ_1"
+        PreferredSubnetId: !Ref PrivateSubnet1ID
+        ThroughputCapacity: !Ref 'ThroughputCapacityOntap'
+        FsxAdminPassword: !Ref 'FsxAdminPassword'
+  
+  ONTAPFileSystemSVM:
+    Type: AWS::FSx::StorageVirtualMachine
+    Condition: ProvisionOntap
+    Properties:
+      FileSystemId: !Ref ONTAPFileSystem
+      Name: !Sub '${Prefix}fsxsvm'
+      RootVolumeSecurityStyle: "NTFS"
+      SvmAdminPassword: !Ref 'FsxAdminPassword'
+
+  CustomDelayResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: EC2InstanceSnp
+    Properties:
+      ServiceToken: !GetAtt 'CustomDelayFunction.Arn'
+      ResourceRef1: !Sub ${AwsAccessKey}
+      ResourceRef2: !Sub ${AwsSecretKey}
+      ResourceRef3: !Sub ${S3BucketName}
+      ResourceRef4: !Sub ${S3FileKey}
+      ResourceRef5: !Sub ${S3PemFile}
+      ResourceRef6: !Ref 'EC2InstanceSnp'
+  CustomDelayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Delay handler"
+      Timeout: 890
+      Role: !GetAtt 'LambdaBasicExecutionRoleOntap.Arn'
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import cfnresponse
+          import boto3
+          import time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info('got event {}'.format(event))
+            try:
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                logger.info('Incoming RequestType: Delete operation')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              if event['RequestType'] in ["Create", "Update"]:
+                time.sleep(120)
+                ResourceRef1= event['ResourceProperties']['ResourceRef1']
+                ResourceRef2=event['ResourceProperties']['ResourceRef2']
+                ResourceRef3=event['ResourceProperties']['ResourceRef3']
+                ResourceRef4=event['ResourceProperties']['ResourceRef4']
+                ResourceRef5=event['ResourceProperties']['ResourceRef5']
+                ResourceRef6=event['ResourceProperties']['ResourceRef6']
+                
+                
+                cmd1 = "Set-AWSCredential -AccessKey " + ResourceRef1 + " -SecretKey " + ResourceRef2
+                cmd2 = "Copy-S3Object -BucketName " + ResourceRef3  + " -Key " + ResourceRef4 + " -LocalFolder C:\\Users\\Administrator\\Desktop"
+                cmd3 = "Copy-S3Object -BucketName " +ResourceRef3 + " -Key " + ResourceRef5 + " -LocalFolder C:\\Users\\Administrator\\Desktop"
+                cmd4 = "$pwdsnp = Get-EC2PasswordData -InstanceId $instanceId -PemFile C:\\Users\\Administrator\\Desktop\\" + ResourceRef5
+                cmd5 = '.\\' + ResourceRef4 + ' /silent /debuglog"C:\\Users\\Administrator\\Desktop\\snplog.txt" BI_USER_NAME=Administrator BI_USER_DOMAIN="" BI_USER_FULL_NAME=Administrator BI_USER_PASSWORD=$pwdsnp SKIP_POWERSHELL_CHECK=true'
+
+                ssm_client = boto3.client('ssm')
+
+                response3 = ssm_client.send_command(InstanceIds=[ResourceRef6], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': ['Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False', cmd1, cmd2, cmd3, 'cd C:\\Users\\Administrator\\Desktop\\', '$instanceId = (Invoke-WebRequest -Uri http://169.254.169.254/latest/meta-data/instance-id).Content', cmd4, cmd5]}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                time.sleep(10)
+                command_id = response3.get('Command').get('CommandId')
+                time.sleep(10)
+                op3 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef6)
+                op3_val = op3.get('StandardOutputContent')
+                if "error" in op3_val.lower():
+                  logger.error("Error with SnapCenter Installation")
+                  responseData = {"Data": op3_val}
+                  cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+
+
+                time.sleep(680)
+                # Delay function
+                logger.info('Delay Complete')        
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                logger.info('Unexpected RequestType!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as err:
+              logger.error(err)
+              responseData = {"Data": str(err)}
+              cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+            return
+
+  CustomSnpResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: CustomDelayResource
+    Properties:
+      ServiceToken: !GetAtt 'CustomSnpFunction.Arn'
+      ResourceRef1: !Sub ${AwsAccessKey}
+      ResourceRef2: !Sub ${AwsSecretKey}
+      ResourceRef3: !Sub ${CustomRdsEC2InstanceId}
+      ResourceRef4: !Sub ${S3BucketName}
+      ResourceRef5: !Ref 'EC2InstanceSnp'
+      ResourceRef6: !Sub ${FsxAdminPassword}
+      ResourceRef7: !Sub ${CustomFSXResource.SVMMgmtIP}
+      ResourceRef8: !Sub ${S3PemFile}
+      ResourceRef9: !Sub ${OsType}
+      ResourceRef10: !Sub ${LogFolderDriveLetter}
+  CustomSnpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Sets up Snapcenter plugin on RDS EC2 instance"
+      Timeout: 890
+      Role: !GetAtt 'LambdaBasicExecutionRoleOntap.Arn'
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import cfnresponse
+          import boto3
+          import time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info('got event {}'.format(event))
+            try:
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                logger.info('Incoming RequestType: Delete operation')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              if event['RequestType'] in ["Create", "Update"]:
+                time.sleep(840)
+                # 1. retrieve resource reference ID or Name
+                ResourceRef1= event['ResourceProperties']['ResourceRef1']
+                ResourceRef2=event['ResourceProperties']['ResourceRef2']
+                ResourceRef3=event['ResourceProperties']['ResourceRef3']
+                ResourceRef4=event['ResourceProperties']['ResourceRef4']
+                ResourceRef5=event['ResourceProperties']['ResourceRef5']
+                ResourceRef6=event['ResourceProperties']['ResourceRef6']
+                ResourceRef7=event['ResourceProperties']['ResourceRef7']
+                ResourceRef8=event['ResourceProperties']['ResourceRef8']
+                ResourceRef9=event['ResourceProperties']['ResourceRef9']
+                ResourceRef10=event['ResourceProperties']['ResourceRef10']
+                #Code for Windows ISCSI initiator config
+                
+                ssm_client = boto3.client('ssm')
+                
+                if "windows" in ResourceRef9.lower():
+                  ResourceRef9 = "windows" 
+
+                cmd1 = 'Set-AWSCredential -AccessKey ' + ResourceRef1 + ' -SecretKey ' + ResourceRef2
+                cmd2 = "$ec2List = Get-EC2Instance -Filter @{'name'='instance-id';'values'='" + ResourceRef3 + "'}"
+                cmd3 = "$pwdrds = Get-EC2PasswordData -InstanceId " + ResourceRef3 + " -PemFile C:\\Users\\Administrator\\Desktop\\database.pem"
+                cmd4 = '$pass = ConvertTo-SecureString ' + ResourceRef6 + ' -asplaintext -force'
+                cmd5 = 'Add-SmStorageconnection -SVM ' + ResourceRef7 + ' -Protocol https -Credential $cred'
+                cmd6 = '$pwd2 = Get-EC2PasswordData -InstanceId ' + ResourceRef5 + ' -PemFile C:\\Users\\Administrator\\Desktop\\' + ResourceRef8
+                cmd7 = "Add-SmCredential -Name 'RDS_Cred' -CredentialType '" +  ResourceRef9 + "' -Credential $credrds -EnableSudoPrevileges $False -Force"
+                cmd8 = "Add-SmHost -HostName $ec2Ip  -OSType '" + ResourceRef9 + "' -CredentialName 'RDS_Cred' -donotaddclusternodes"
+                cmd9 = "del C:\\Users\\Administrator\\Desktop\\" + ResourceRef8
+                cmd10 = 'Set-SmPluginConfiguration -PluginCode SCSQL -HostName $ec2Ip -HostLogFolders @{"Host"=$ec2Ip;"Log Folder"="' + ResourceRef10 + '"} -Verbose -IgnoreVscConfiguredCheck:$true -confirm:$false'
+                
+                response3 = ssm_client.send_command(InstanceIds=[ResourceRef5], DocumentName="AWS-RunPowerShellScript", Parameters={'commands': ['Start-Transcript',cmd1, cmd2, '$noAgentList = $ec2List.Instances | Where-Object {($_ | Select-Object -ExpandProperty tags | Where-Object -Property Key -eq Name ).value}','$keyName = $noAgentList.KeyName', '$ec2Ip = $noAgentList.PrivateIpAddress', 'Get-SECSecretList | Where-Object{$_.Name -like $keyName } | ForEach-Object{$ARN = $_.ARN}', '$sec = Get-SECSecretValue -SecretId $ARN', 'echo $sec.SecretString > C:\\Users\\Administrator\\Desktop\\database.pem', cmd3, 'get-module -listavailable snap* | import-module', cmd6, '$pass = ConvertTo-SecureString $pwd2 -asplaintext -force', '$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList Administrator, $pass', "Open-SmConnection -Credential $cred -RoleName 'SnapCenterAdmin'", '$passrds = ConvertTo-SecureString $pwdrds -asplaintext -force', '$credrds = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList Administrator, $passrds', cmd7 , cmd8, 'Start-Sleep -Seconds 360', 'Install-SmHostPackage -HostNames @($ec2Ip)  -PluginCodes SCSQL,SCW  -SkipPreinstallChecks:$true -verbose -Force', cmd4, '$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList vsadmin, $pass', cmd5, cmd10, "Add-SMPolicy -PolicyName 'rds_backup' -PolicyType 'Backup' -Description 'Full and log backup Policy'  -pluginpolicytype 'SCSQL' -sqlbackuptype 'Fullbackupandlogbackup'", 'del C:\\Users\\Administrator\\Desktop\\database.pem', cmd9]}, CloudWatchOutputConfig={ 'CloudWatchOutputEnabled': True} )
+                time.sleep(10)
+                command_id = response3.get('Command').get('CommandId')
+                time.sleep(10)
+                op3 = ssm_client.get_command_invocation( CommandId= command_id, InstanceId= ResourceRef5)
+                op3_val = op3.get('StandardOutputContent')
+                if "error" in op3_val.lower():
+                  logger.error("Error with SnapCenter Plugin Installation and Setup")
+                  responseData = {"Data": op3_val}
+                  cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+                logger.info('SnapCenter config and host plugin Installation complete')        
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                logger.info('Unexpected RequestType!')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as err:
+              logger.error(err)
+              responseData = {"Data": str(err)}
+              cfnresponse.send(event,context,cfnresponse.FAILED,responseData)
+            return
