@@ -19,9 +19,18 @@ This template also integrates the Netapp Snapcenter software with Fsx Ontap to a
 
 - Custom RDS Instance, SnapCenter server Instance and Fsx Ontap should be able to communicate with each other (networking and security groups need to ensure the same)
 
-- S3 Bucket with packages.zip, SnapCenter executable file and a pem file uploaded to it
+- S3 Bucket with packages.zip, SnapCenter installation file and a pem file uploaded to it
+  
+  Note: packages.zip file can be created using the commands given below on a Linux machine:
+
   ```
-  Note: packages.zip file can be found in the CloudFormation/Resources folder of this repository.
+  mkdir packages
+  cd packages
+  pip install requests -t .
+  pip install netapp-ontap -t .
+  rm -rf *dist-info
+  cd ..
+  zip -r packages.zip packages
   ```
 
 
@@ -63,7 +72,7 @@ This template also integrates the Netapp Snapcenter software with Fsx Ontap to a
    git clone https://github.com/netapp-vedantsethia/aws_rds_fsx_automation.git
    ```
 
-2. Login to AWS console and upload the pre-requisites from the "Resources" folder to your S3 bucket.
+2. Login to AWS console and upload the pre-requisites mentioned in the CloudFormation template to your S3 bucket.
 
 3. Navigate to CloudFormation service.
 
