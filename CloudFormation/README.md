@@ -69,7 +69,7 @@ This template also integrates the Netapp Snapcenter software with Fsx Ontap to a
 
 1. Clone the GitHub repository.
    ```
-   git clone https://github.com/NetApp-Automation/fsxn-iscsisetup-cft.git
+   git clone https://github.com/NetApp/fsxn-iscsisetup-cft.git
    ```
 
 2. Login to AWS console and upload the pre-requisites mentioned in the CloudFormation template to your S3 bucket.
